@@ -5,10 +5,14 @@ use tracing::{debug, info, warn};
 
 use crate::gpu::buffer::CompilationTask;
 
+const COMPILATION_SHADER: &str = include_str!("compilation.wgsl");
+
 pub struct Monomorphizer {
     instantiations: HashMap<String, MonomorphizedInstance>,
     generic_functions: HashMap<String, GenericFunction>,
     config: MonomorphizerConfig,
+    device: Option<Arc<wgpu::Device>>,
+    queue: Option<Arc<wgpu::Queue>>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,13 +67,15 @@ pub enum TypeInfo {
 }
 
 impl Monomorphizer {
-    pub fn new(config: MonomorphizerConfig) -> Self {
+    pub fn new(config: MonomorphizerConfig, device: Option<Arc<wgpu::Device>>, queue: Option<Arc<wgpu::Queue>>) -> Self {
         info!("Initializing GPU Monomorphizer with config: {:?}", config);
         
         Self {
             instantiations: HashMap::new(),
             generic_functions: HashMap::new(),
             config,
+            device,
+            queue,
         }
     }
 
@@ -221,15 +227,99 @@ impl Monomorphizer {
     }
 
     async fn process_code_chunk_gpu(&self, chunk: &[u8]) -> Result<Vec<u8>> {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        
-        let mut optimized = Vec::with_capacity(chunk.len());
-        
-        for &byte in chunk {
-            optimized.push(if byte % 3 == 0 { byte.wrapping_add(1) } else { byte });
+        let device = self.device.as_ref().ok_or_else(|| anyhow!("GPU device not available for monomorphization"))?;
+        let queue = self.queue.as_ref().ok_or_else(|| anyhow!("GPU queue not available for monomorphization"))?;
+
+        debug!("Processing {} bytes of code on GPU", chunk.len());
+
+        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Monomorphization Shader"),
+            source: wgpu::ShaderSource::Wgsl(COMPILATION_SHADER.into()),
+        });
+
+        let aligned_size = ((chunk.len() + 3) / 4) * 4;
+        let input_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Monomorphization Input"),
+            size: aligned_size as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let output_size = std::cmp::max(chunk.len() * 2, 2048);
+        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Monomorphization Output"),
+            size: output_size as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let mut aligned_data = vec![0u8; aligned_size];
+        aligned_data[..chunk.len()].copy_from_slice(chunk);
+        queue.write_buffer(&input_buffer, 0, &aligned_data);
+
+        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Monomorphization Pipeline"),
+            layout: None,
+            module: &shader_module,
+            entry_point: "main",
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Monomorphization Bind Group"),
+            layout: &compute_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: output_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Monomorphization Encoder"),
+        });
+
+        let workgroup_count = std::cmp::max(1, (chunk.len() + 255) / 256);
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Monomorphization Pass"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&compute_pipeline);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
+            compute_pass.dispatch_workgroups(workgroup_count as u32, 1, 1);
         }
 
-        Ok(optimized)
+        let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Monomorphization Readback"),
+            size: output_size as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &readback_buffer, 0, output_size as u64);
+
+        let command_buffer = encoder.finish();
+        queue.submit(Some(command_buffer));
+
+        let buffer_slice = readback_buffer.slice(..);
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        device.poll(wgpu::Maintain::Wait);
+
+        receiver.await??;
+
+        let data = buffer_slice.get_mapped_range();
+        let result: Vec<u8> = data.to_vec();
+
+        debug!("GPU monomorphization completed: {} -> {} bytes", chunk.len(), result.len());
+        Ok(result)
     }
 
     fn analyze_dependencies(

@@ -12,8 +12,8 @@ use crate::gpu::monitoring::{PerformanceMonitor, TaskHandle};
 pub struct GpuDispatcher {
     is_available: bool,
     config: DispatcherConfig,
-    device: Option<wgpu::Device>,
-    queue: Option<wgpu::Queue>,
+    device: Option<Arc<wgpu::Device>>,
+    queue: Option<Arc<wgpu::Queue>>,
     adapter: Option<wgpu::Adapter>,
     monomorphizer: Option<Monomorphizer>,
     cgu_manager: Option<CodegenUnitManager>,
@@ -156,7 +156,7 @@ impl GpuDispatcher {
             ).await {
                 Ok((device, queue)) => {
                     info!("GPU device initialized successfully");
-                    (Some(device), Some(queue))
+                    (Some(Arc::new(device)), Some(Arc::new(queue)))
                 }
                 Err(e) => {
                     warn!("Failed to initialize GPU device: {}, falling back to CPU", e);
@@ -181,8 +181,14 @@ impl GpuDispatcher {
         
         // Initialize advanced GPU components if GPU is available
         let (monomorphizer, cgu_manager, function_lowerer, optimizer) = if device.is_some() {
+            let device_clone = device.clone();
+            let queue_clone = queue.clone();
             (
-                Some(Monomorphizer::new(crate::gpu::monomorphizer::MonomorphizerConfig::default())),
+                Some(Monomorphizer::new(
+                    crate::gpu::monomorphizer::MonomorphizerConfig::default(),
+                    device_clone,
+                    queue_clone,
+                )),
                 Some(CodegenUnitManager::new(crate::gpu::codegen_units::CGUConfig::default())),
                 Some(FunctionLowerer::new(LoweringConfig::default())),
                 Some(PeepholeOptimizer::new(OptimizationConfig::default())),

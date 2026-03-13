@@ -145,7 +145,11 @@ impl MirProcessor {
     pub fn new(config: MirProcessorConfig) -> Result<Self> {
         info!("Initializing MirProcessor with config: {:?}", config);
         
-        let monomorphizer = Monomorphizer::new(crate::gpu::monomorphizer::MonomorphizerConfig::default());
+        let monomorphizer = Monomorphizer::new(
+            crate::gpu::monomorphizer::MonomorphizerConfig::default(),
+            None,
+            None,
+        );
         
         let rustc_interface = if config.use_rustc_api {
             Some(RustcInterface::new()?)

@@ -1,6 +1,6 @@
 [package]
 name = "cargpu"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 description = "Drop-in cargo replacement with GPU acceleration for Rust compilation"
 repository = "https://github.com/commandline-studios/cargpu"
