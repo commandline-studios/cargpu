@@ -1,0 +1,455 @@
+use anyhow::{anyhow, Result};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Arc;
+use tracing::{debug, info, warn};
+
+use crate::gpu::monomorphizer::{Monomorphizer, MonomorphizerConfig, MonomorphizedInstance, TypeInfo};
+
+pub struct MirProcessor {
+    monomorphizer: Monomorphizer,
+    config: MirProcessorConfig,
+    rustc_interface: Option<RustcInterface>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirProcessorConfig {
+    pub enable_cross_crate_optimization: bool,
+    pub enable_mir_optimization: bool,
+    pub max_generic_depth: usize,
+    pub cache_mir_data: bool,
+    pub use_rustc_api: bool,
+}
+
+impl Default for MirProcessorConfig {
+    fn default() -> Self {
+        Self {
+            enable_cross_crate_optimization: true,
+            enable_mir_optimization: true,
+            max_generic_depth: 10,
+            cache_mir_data: true,
+            use_rustc_api: false, // Start with external parsing
+    }
+        &mut self,
+        generic_functions: Vec<MirFunction>,
+    ) -> Result<Vec<MonomorphizedInstance>> {
+        debug!("Monomorphizing {} generic functions", generic_functions.len());
+        
+        let mut instances = Vec::new();
+        
+        for function in generic_functions {
+            // Generate common instantiations based on function signature
+            let instance_count = function.generic_params.len();
+            
+            if instance_count == 1 {
+                // Single generic parameter - create instances for common types
+                let common_types = vec![TypeInfo::I32, TypeInfo::I64, TypeInfo::F64];
+                for concrete_type in common_types {
+                    let instance_name = self.generate_instance_name(&function.name, &[concrete_type.clone()]);
+                    let key = self.generate_instance_key(&function.name, &[concrete_type.clone()]);
+                    
+                    if let Some(cached) = self.monomorphizer.get_cached_instance(&key) {
+                        instances.push(cached.clone());
+                    } else {
+                        // Create a simple mock instance
+                        instances.push(crate::gpu::monomorphizer::MonomorphizedInstance {
+                            function_name: instance_name.clone(),
+                            concrete_types: vec![concrete_type.clone()],
+                            optimized_code: format!("optimized_{}_{}", function.name, self.type_to_string(&concrete_type)).into_bytes(),
+                            dependency_graph: Vec::new(),
+                            size_bytes: 1024,
+                        });
+                    }
+                }
+            } else if instance_count == 2 {
+                // Two generic parameters - create matrix of common combinations
+                let common_types = vec![TypeInfo::I32, TypeInfo::F64];
+                for type1 in &common_types {
+                    for type2 in &common_types {
+                        let instance_name = self.generate_instance_name(&function.name, &[type1.clone(), type2.clone()]);
+                        let key = self.generate_instance_key(&function.name, &[type1.clone(), type2.clone()]);
+                        
+                        if let Some(cached) = self.monomorphizer.get_cached_instance(&key) {
+                            instances.push(cached.clone());
+                        } else {
+                            instances.push(crate::gpu::monomorphizer::MonomorphizedInstance {
+                                function_name: instance_name.clone(),
+                                concrete_types: vec![type1.clone(), type2.clone()],
+                                optimized_code: format!("optimized_{}_{}", function.name, self.type_to_string(type1), self.type_to_string(type2)).into_bytes(),
+                                dependency_graph: Vec::new(),
+                                size_bytes: 2048,
+                            });
+                        }
+                    }
+                }
+            } else {
+                // More complex generic - just create basic instance
+                let instance_name = self.generate_instance_name(&function.name, &[]);
+                instances.push(crate::gpu::monomorphizer::MonomorphizedInstance {
+                    function_name: instance_name.clone(),
+                    concrete_types: function.generic_params.iter().map(|_| TypeInfo::I32).collect(),
+                    optimized_code: format!("optimized_{}", function.name).into_bytes(),
+                    dependency_graph: Vec::new(),
+                    size_bytes: 1024,
+                });
+            }
+        }
+
+        Ok(instances)
+    }
+    }
+            }
+        } else if instance_count == 2 {
+            // Two generic parameters - create matrix of common combinations
+            let common_types = vec![TypeInfo::I32, TypeInfo::F64];
+            for type1 in &common_types {
+                for type2 in &common_types {
+                let instance_name = self.generate_instance_name(&function.name, &[type1.clone(), type2.clone()]);
+                let key = self.generate_instance_key(&function.name, &[type1.clone(), type2.clone()]);
+                    
+                    if let Some(cached) = self.monomorphizer.get_cached_instance(&key) {
+                        instances.push(cached.clone());
+                    } else {
+                        instances.push(crate::gpu::monomorphizer::MonomorphizedInstance {
+                            function_name: instance_name.clone(),
+                            concrete_types: vec![type1.clone(), type2.clone()],
+                            optimized_code: format!("optimized_{}_{}_{}", function.name, self.type_to_string(type1), self.type_to_string(type2)).into_bytes(),
+                            dependency_graph: Vec::new(),
+                            size_bytes: 2048,
+                        });
+                    }
+                }
+            }
+        } else {
+            // More complex generic - just create basic instance
+            let instance_name = self.generate_instance_name(&function.name, &[]);
+            instances.push(crate::gpu::monomorphizer::MonomorphizedInstance {
+                function_name: instance_name.clone(),
+                concrete_types: function.generic_params.iter().map(|_| TypeInfo::I32).collect(),
+                optimized_code: format!("optimized_{}", function.name).into_bytes(),
+                dependency_graph: Vec::new(),
+                size_bytes: 1024,
+            });
+        }
+
+        Ok(instances)
+    }
+
+    fn convert_mir_function_to_generic(&self, function: MirFunction) -> Result<crate::gpu::monomorphizer::GenericFunction> {
+        let function_clone = function.clone();
+        Ok(crate::gpu::monomorphizer::GenericFunction {
+            name: function.name.clone(),
+            type_params: function.generic_params.iter().map(|p| p.name.clone()).collect(),
+            param_types: function.local_decls.iter().skip(1).map(|l| l.ty.clone()).collect(),
+            return_type: function_clone.return_type,
+            body_ir: self.serialize_mir_function(&function)?,
+        })
+    }
+
+    fn serialize_mir_function(&self, function: &MirFunction) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        
+        // Serialize function header
+        bytes.extend_from_slice(&(function.name.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(function.name.as_bytes());
+        
+        // Serialize basic blocks
+        bytes.extend_from_slice(&(function.basic_blocks.len() as u32).to_le_bytes());
+        for block in &function.basic_blocks {
+            bytes.extend_from_slice(&(block.id as u32).to_le_bytes());
+            bytes.extend_from_slice(&(block.statements.len() as u32).to_le_bytes());
+        }
+        
+        Ok(bytes)
+    }
+
+    fn generate_instance_key(&self, function_name: &str, concrete_types: &[TypeInfo]) -> String {
+        let type_strings: Vec<String> = concrete_types
+            .iter()
+            .map(|t| self.type_to_string(t))
+            .collect();
+        format!("{}__{}", function_name, type_strings.join("_"))
+    }
+
+    fn generate_instance_name(&self, function_name: &str, concrete_types: &[TypeInfo]) -> String {
+        let type_strings: Vec<String> = concrete_types
+            .iter()
+            .map(|t| self.type_to_string(t))
+            .collect();
+        if concrete_types.is_empty() {
+            function_name.to_string()
+        } else {
+            format!("{}_for_{}", function_name, type_strings.join("_and_"))
+        }
+    }
+
+    fn type_to_string(&self, type_info: &TypeInfo) -> String {
+        match type_info {
+            TypeInfo::I32 => "i32".to_string(),
+            TypeInfo::I64 => "i64".to_string(),
+            TypeInfo::F32 => "f32".to_string(),
+            TypeInfo::F64 => "f64".to_string(),
+            TypeInfo::Bool => "bool".to_string(),
+            TypeInfo::String => "str".to_string(),
+            TypeInfo::Generic(name) => name.clone(),
+            TypeInfo::Struct { name, fields } => {
+                let field_strings: Vec<String> = fields
+                    .iter()
+                    .map(|(name, ty)| format!("{}:{}", name, self.type_to_string(ty)))
+                    .collect();
+                format!("{}{{{}}}", name, field_strings.join(","))
+            }
+            TypeInfo::Array { element, size } => format!("[{};{}]", self.type_to_string(element), size),
+            TypeInfo::Slice(element) => format!("[{}]", self.type_to_string(element)),
+            TypeInfo::Reference(inner) => format!("&{}", self.type_to_string(inner)),
+            TypeInfo::MutReference(inner) => format!("&mut {}", self.type_to_string(inner)),
+        }
+    }
+
+    async fn optimize_mir_function(&self, function: &MirFunction) -> Result<Vec<u8>> {
+        debug!("Optimizing MIR function: {}", function.name);
+
+        let mut optimized = self.convert_mir_to_ir(function).await?;
+
+        // Apply MIR-specific optimizations
+        optimized = self.constant_propagation(&optimized).await?;
+        optimized = self.dead_code_elimination(&optimized).await?;
+        optimized = self.loop_optimization(&optimized).await?;
+
+        Ok(optimized)
+    }
+
+    async fn convert_mir_to_ir(&self, function: &MirFunction) -> Result<Vec<u8>> {
+        debug!("Converting MIR to IR for: {}", function.name);
+
+        let mut ir_bytes = Vec::new();
+
+        for (block_id, block) in function.basic_blocks.iter().enumerate() {
+            // Block header
+            ir_bytes.push(0xBB); // Block begin
+            ir_bytes.extend_from_slice(&(block_id as u32).to_le_bytes());
+
+            for statement in &block.statements {
+                let statement_bytes = self.serialize_mir_statement(statement).await?;
+                ir_bytes.extend_from_slice(&statement_bytes);
+            }
+
+            if let Some(terminator) = &block.terminator {
+                let terminator_bytes = self.serialize_mir_terminator(terminator).await?;
+                ir_bytes.extend_from_slice(&terminator_bytes);
+            }
+
+            ir_bytes.push(0xBE); // Block end
+        }
+
+        Ok(ir_bytes)
+    }
+
+    async fn serialize_mir_statement(&self, statement: &MirStatement) -> Result<Vec<u8>> {
+        match statement {
+            MirStatement::Assign { place, rvalue } => {
+                let mut bytes = vec![0x01]; // Assign opcode
+                bytes.extend_from_slice(&self.serialize_mir_place(place));
+                bytes.extend_from_slice(&self.serialize_mir_rvalue(rvalue).await?);
+                Ok(bytes)
+            }
+            MirStatement::Nop => Ok(vec![0x00]),
+            _ => Ok(vec![0xFF]), // Unsupported
+        }
+    }
+
+    async fn serialize_mir_terminator(&self, terminator: &MirTerminator) -> Result<Vec<u8>> {
+        match terminator {
+            MirTerminator::Return => Ok(vec![0x90]),
+            MirTerminator::Goto { target } => {
+                let mut bytes = vec![0x91];
+                bytes.extend_from_slice(&(*target as u32).to_le_bytes());
+                Ok(bytes)
+            }
+            _ => Ok(vec![0xFF]), // Unsupported
+        }
+    }
+
+    fn serialize_mir_place(&self, place: &MirPlace) -> Vec<u8> {
+        let mut bytes = vec![0x40]; // Place marker
+        bytes.extend_from_slice(&(place.local.id as u32).to_le_bytes());
+        // TODO: serialize projections
+        bytes
+    }
+
+    async fn serialize_mir_rvalue(&self, rvalue: &MirRvalue) -> Result<Vec<u8>> {
+        match rvalue {
+            MirRvalue::Use(operand) => {
+                let mut bytes = vec![0x10]; // Use opcode
+                bytes.extend_from_slice(&self.serialize_mir_operand(operand));
+                Ok(bytes)
+            }
+            MirRvalue::BinaryOp(op, left, right) => {
+                let mut bytes = vec![0x11]; // BinaryOp opcode
+                bytes.push(*op as u8);
+                bytes.extend_from_slice(&self.serialize_mir_operand(left));
+                bytes.extend_from_slice(&self.serialize_mir_operand(right));
+                Ok(bytes)
+            }
+            _ => Ok(vec![0xFF]), // Unsupported
+        }
+    }
+
+    fn serialize_mir_operand(&self, operand: &MirOperand) -> Vec<u8> {
+        match operand {
+            MirOperand::Copy(place) => {
+                let mut bytes = vec![0x20];
+                bytes.extend_from_slice(&self.serialize_mir_place(place));
+                bytes
+            }
+            MirOperand::Move(place) => {
+                let mut bytes = vec![0x21];
+                bytes.extend_from_slice(&self.serialize_mir_place(place));
+                bytes
+            }
+            _ => vec![0xFF], // Unsupported
+        }
+    }
+
+    async fn constant_propagation(&self, ir: &[u8]) -> Result<Vec<u8>> {
+        // Simple constant folding simulation
+        let mut optimized = Vec::with_capacity(ir.len());
+        
+        for chunk in ir.chunks(16) {
+            let mut chunk_processed = chunk.to_vec();
+            
+            // Simple pattern: 0x11 0x00 0x20 0x40 0x00 0x00 0x00 0x00 0x20 0x40 0x00 0x00 0x00 0x00
+            // Represents add reg0, reg1, reg2 -> fold if both are constants
+            if chunk_processed.len() >= 12 && chunk_processed[0] == 0x11 {
+                // Simulate constant folding
+                if chunk_processed[2] == 0x20 && chunk_processed[6] == 0x20 {
+                    chunk_processed[0] = 0x12; // Folded operation
+                }
+            }
+            
+            optimized.extend_from_slice(&chunk_processed);
+        }
+        
+        Ok(optimized)
+    }
+
+    async fn dead_code_elimination(&self, ir: &[u8]) -> Result<Vec<u8>> {
+        // Simple dead code elimination simulation
+        let mut optimized = Vec::new();
+        
+        for &byte in ir {
+            if byte != 0x00 && byte != 0xFF { // Skip nops and unsupported
+                optimized.push(byte);
+            }
+        }
+        
+        Ok(optimized)
+    }
+
+    async fn loop_optimization(&self, ir: &[u8]) -> Result<Vec<u8>> {
+        // Simple loop optimization simulation
+        let mut optimized = ir.to_vec();
+        
+        // Replace simple loop patterns with optimized versions
+        for i in 0..optimized.len().saturating_sub(4) {
+            if optimized[i] == 0x91 && optimized[i+4] == 0x91 {
+                // Found goto goto pattern - optimize
+                optimized[i] = 0x92; // Optimized goto
+            }
+        }
+        
+        Ok(optimized)
+    }
+
+    fn is_gpu_suitable_function(&self, function: &MirFunction) -> bool {
+        // Heuristics for GPU suitability
+        let has_loops = function.basic_blocks.iter().any(|block| {
+            matches!(block.terminator, Some(MirTerminator::Goto { .. }))
+        });
+        
+        let has_arithmetic = function.basic_blocks.iter().any(|block| {
+            block.statements.iter().any(|stmt| {
+                matches!(stmt, MirStatement::Assign { rvalue: MirRvalue::BinaryOp(..), .. })
+            })
+        });
+        
+        let is_generic = !function.generic_params.is_empty();
+        
+        has_loops && has_arithmetic && !is_generic
+    }
+
+    async fn analyze_crate_dependencies(&self, crate_root: &PathBuf) -> Result<Vec<String>> {
+        debug!("Analyzing crate dependencies for: {:?}", crate_root);
+
+        let mut cmd = Command::new("cargo");
+        cmd.args(["metadata", "--format-version", "1", "--no-deps"]);
+        cmd.current_dir(crate_root);
+
+        let output = cmd.output()?;
+        if !output.status.success() {
+            warn!("Failed to get metadata: {}", String::from_utf8_lossy(&output.stderr));
+            return Ok(vec![]);
+        }
+
+        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let mut dependencies = Vec::new();
+
+        if let Some(packages) = metadata.get("packages").and_then(|p| p.as_array()) {
+            if let Some(root_package) = packages.first() {
+                if let Some(deps) = root_package.get("dependencies").and_then(|d| d.as_array()) {
+                    for dep in deps {
+                        if let Some(name) = dep.get("name").and_then(|n| n.as_str()) {
+                            dependencies.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(dependencies)
+    }
+}
+
+impl RustcInterface {
+    fn new() -> Result<Self> {
+        let output = Command::new("rustc").args(["--print", "sysroot"]).output()?;
+        if !output.status.success() {
+            return Err(anyhow!("Failed to get rustc sysroot"));
+        }
+
+        let sysroot = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        
+        let output = Command::new("rustc").args(["-vV"]).output()?;
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        
+        let mut target_triple = "x86_64-unknown-linux-gnu".to_string();
+        for line in output_str.lines() {
+            if line.starts_with("host: ") {
+                target_triple = line.strip_prefix("host: ").unwrap().to_string();
+                break;
+            }
+        }
+
+        Ok(Self {
+            sysroot,
+            target_triple,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessedCrate {
+    pub functions: Vec<ProcessedFunction>,
+    pub monomorphized_instances: Vec<MonomorphizedInstance>,
+    pub dependencies: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessedFunction {
+    pub name: String,
+    pub def_id: String,
+    pub optimized_mir: Vec<u8>,
+    pub return_type: TypeInfo,
+    pub is_gpu_suitable: bool,
+}

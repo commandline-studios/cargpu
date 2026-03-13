@@ -1,0 +1,96 @@
+[package]
+name = "cargpu"
+version = "0.0.1"
+edition = "2024"
+description = "Drop-in cargo replacement with GPU acceleration for Rust compilation"
+repository = "https://github.com/commandline-studios/cargpu"
+authors = ["commandline studios"]
+
+[dependencies]
+# CLI and argument parsing
+clap = { version = "4.4", features = ["derive", "env"] }
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Cargo compatibility
+cargo = "0.76"
+cargo-platform = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+serde_json = "1.0"
+cargo_metadata = "0.18"
+
+# Cranelift and compiler infrastructure
+cranelift = "0.108"
+cranelift-codegen = "0.108"
+cranelift-frontend = "0.108"
+cranelift-module = "0.108"
+cranelift-native = "0.108"
+cranelift-object = "0.108"
+
+# Rust compiler internals
+rustc_driver = { path = "../rust-source/compiler/rustc_driver", optional = true }
+rustc_interface = { path = "../rust-source/compiler/rustc_interface", optional = true }
+rustc_middle = { path = "../rust-source/compiler/rustc_middle", optional = true }
+rustc_span = { path = "../rust-source/compiler/rustc_span", optional = true }
+rustc_data_structures = { path = "../rust-source/compiler/rustc_data_structures", optional = true }
+rustc_mir_build = { path = "../rust-source/compiler/rustc_mir_build", optional = true }
+rustc_session = { path = "../rust-source/compiler/rustc_session", optional = true }
+
+# GPU compute and graphics
+wgpu = "0.19"
+naga = { version = "0.19", features = ["wgsl-out", "spv-out", "glsl-out"] }
+rspirv = { version = "0.9", optional = true }
+spirv_cross = "0.23"
+bytemuck = { version = "1.14", features = ["derive"] }
+
+# CUDA support (optional)
+cudarc = { version = "0.10", optional = true }
+
+# Metal support (macOS, optional)
+metal = { version = "0.27", optional = true }
+objc = { version = "0.2", optional = true }
+
+# DirectX 12 support (Windows, optional)
+winapi = { version = "0.3", features = ["d3d12"], optional = true }
+d3d12 = { version = "0.7", optional = true }
+
+# Parallelism and async
+rayon = "1.8"
+tokio = { version = "1.0", features = ["full"] }
+crossbeam = "0.8"
+parking_lot = "0.12"
+futures = "0.3"
+uuid = { version = "1.6", features = ["v4"] }
+
+# Memory and performance
+memmap2 = "0.9"
+tempfile = "3.8"
+fs_extra = "1.3"
+
+# GPU-specific optimization
+gpu-allocator = "0.25"
+
+[features]
+default = ["spirv-backend"]
+rustc-internals = ["rustc_driver", "rustc_interface", "rustc_middle", "rustc_span", "rustc_data_structures", "rustc_mir_build", "rustc_session"]
+spirv-backend = ["rspirv"]
+ptx-backend = ["cudarc"] 
+msl-backend = ["metal", "objc"]
+dxil-backend = ["winapi", "d3d12"]
+all-backends = ["spirv-backend", "ptx-backend", "msl-backend", "dxil-backend", "rustc-internals"]
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1.4"
+
+[[bin]]
+name = "cargpu"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
