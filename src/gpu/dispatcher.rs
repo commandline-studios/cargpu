@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use std::collections::{VecDeque, HashMap};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+use wgpu;
 
 use crate::gpu::monomorphizer::{Monomorphizer, MonomorphizedInstance, GenericFunction, TypeInfo};
 use crate::gpu::codegen_units::{CodegenUnitManager, CodegenUnit, CGUFunction, CompilationWave, CompilationStage};
@@ -799,14 +800,159 @@ impl GpuDispatcher {
         }
     }
 
+    pub fn compute_hashes_gpu(&mut self, data_chunks: &[Vec<u8>]) -> Result<Vec<u64>> {
+        if !self.is_gpu_available() || data_chunks.is_empty() {
+            return Ok(data_chunks.iter().map(|d| self.fallback_hash(d)).collect());
+        }
+
+        let device = self.device.as_ref().ok_or_else(|| anyhow!("GPU device not available"))?;
+        let queue = self.queue.as_ref().ok_or_else(|| anyhow!("GPU queue not available"))?;
+
+        let total_bytes: usize = data_chunks.iter().map(|c| c.len()).sum();
+        let total_u32s = (total_bytes + 3) / 4;
+
+        let shader_src = &format!(r#"
+@group(0) @binding(0)
+var<storage, read> input_data: array<u32>;
+
+@group(0) @binding(1)
+var<storage, read_write> hash_output: array<u32>;
+
+@group(0) @binding(2)
+var<uniform> config: vec4u;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
+    let idx = global_id.x;
+    let data_len = config.x;
+    let chunk_offset = config.y;
+    
+    if idx >= data_len {{
+        return;
+    }}
+    
+    var hash: u32 = 2166136261u;
+    let data = input_data[idx];
+    
+    hash = hash ^ (data & 0xFFu);
+    hash = hash * 16777619u;
+    hash = hash ^ ((data >> 8u) & 0xFFu);
+    hash = hash * 16777619u;
+    hash = hash ^ ((data >> 16u) & 0xFFu);
+    hash = hash * 16777619u;
+    hash = hash ^ ((data >> 24u) & 0xFFu);
+    hash = hash * 16777619u;
+    
+    hash_output[idx] = hash;
+}}
+"#);
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Hash Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Hash Pipeline"),
+            layout: None,
+            module: &shader,
+            entry_point: "main",
+        });
+
+        let input_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Hash Input"),
+            size: (total_u32s * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Hash Output"),
+            size: (total_u32s * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let mut packed_data = vec![0u32; total_u32s];
+        let mut offset = 0usize;
+        for chunk in data_chunks {
+            for (i, byte) in chunk.iter().enumerate() {
+                packed_data[offset + i / 4] |= (*byte as u32) << ((i % 4) * 8);
+            }
+            offset += (chunk.len() + 3) / 4;
+        }
+
+        queue.write_buffer(&input_buffer, 0, unsafe {
+            std::slice::from_raw_parts(packed_data.as_ptr() as *const u8, packed_data.len() * 4)
+        });
+
+        let config_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Hash Config"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&config_buffer, 0, &(total_u32s as u32).to_le_bytes());
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Hash Bind Group"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: input_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: output_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: config_buffer.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Hash Encoder") });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { 
+                label: Some("Hash Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(total_u32s as u32, 1, 1);
+        }
+
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Hash Readback"),
+            size: (total_u32s * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &readback, 0, (total_u32s * 4) as u64);
+
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+
+        let mapped = slice.get_mapped_range();
+        let mut combined_hash: u64 = 0;
+        for (i, chunk) in data_chunks.iter().enumerate() {
+            let chunk_start = data_chunks[..i].iter().map(|c| (c.len() + 3) / 4).sum::<usize>();
+            if chunk_start < total_u32s {
+                let h = mapped.as_ref().get(chunk_start).copied().unwrap_or(0);
+                combined_hash = combined_hash.wrapping_add((h as u64).wrapping_mul(chunk.len() as u64 + 1));
+            }
+        }
+
+        Ok(vec![combined_hash])
+    }
+
     fn hash_data(&self, data: &[u8]) -> u64 {
-        // Simple hash function for cache keys
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         
         let mut hasher = DefaultHasher::new();
         data.hash(&mut hasher);
         hasher.finish()
+    }
+
+    fn fallback_hash(&self, data: &[u8]) -> u64 {
+        self.hash_data(data)
     }
 
     pub fn get_detailed_statistics(&self) -> Result<GpuStatistics> {
